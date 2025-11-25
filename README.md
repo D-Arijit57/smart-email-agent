@@ -1,5 +1,5 @@
 
-# Smart Email Productivity Agent (OceanAI)
+# Smart Email Productivity Agent 
 
 An intelligent, prompt-driven email client capable of processing an inbox, categorizing emails, extracting action items, and drafting replies using the Google Gemini API.
 
