@@ -1,11 +1,12 @@
+
 import { GoogleGenAI, Type } from "@google/genai";
 import { Email, ActionItem, EmailCategory } from "../types";
 
 // Helper to get client safely
 const getClient = () => {
-  const apiKey = process.env.API_KEY;
+  const apiKey = process.env.API_KEY; 
   if (!apiKey) {
-    throw new Error("API Key is missing in environment variables.");
+    throw new Error("API Key is missing. Please set API_KEY in your environment.");
   }
   return new GoogleGenAI({ apiKey });
 };
@@ -36,84 +37,43 @@ async function withRetry<T>(fn: () => Promise<T>, retries = 3, delay = 1000): Pr
 
 /**
  * Phase 1: High-Speed Pre-Triage
- * Classifies emails locally using heuristics to save API calls and reduce latency.
+ * ONLY filters obvious Spam and Newsletters to save tokens.
+ * Complex categorization (Important vs Others vs To-Do) is deferred to the LLM.
  */
 export const heuristicCategorize = (email: Email): { category?: string; confidence: number } => {
   const content = (email.subject + " " + email.body).toLowerCase();
   const sender = email.senderEmail.toLowerCase();
   const fromName = email.sender.toLowerCase();
 
-  // Rules for Spam
+  // 1. Obvious Spam (High Confidence)
   if (
-    content.includes("lottery") || 
     content.includes("wire transfer") || 
     content.includes("inheritance") || 
     content.includes("urgent business proposal") ||
     content.includes("verify your account") ||
-    content.includes("bank details") ||
-    sender.includes("wealth")
+    (content.includes("bank details") && sender.includes("wealth"))
   ) {
-    return { category: EmailCategory.SPAM, confidence: 0.95 };
+    return { category: EmailCategory.SPAM, confidence: 0.99 };
   }
 
-  // Rules for Newsletter
+  // 2. Obvious Newsletter (High Confidence)
   if (
     content.includes("unsubscribe") || 
     content.includes("view in browser") || 
     sender.includes("newsletter") || 
     sender.includes("no-reply") || 
-    sender.includes("info@") ||
     fromName.includes("weekly")
   ) {
-    return { category: EmailCategory.NEWSLETTER, confidence: 0.9 };
+    return { category: EmailCategory.NEWSLETTER, confidence: 0.95 };
   }
 
-  // Rules for Important (DevOps / PM / System Alerts / HR / Invoices)
-  if (
-    sender.includes('alert') ||
-    sender.includes('monitoring') ||
-    fromName.includes('devops') ||
-    fromName.includes('project manager') ||
-    content.includes('cpu usage') ||
-    content.includes('server down') ||
-    content.includes('incident') ||
-    content.includes('roadmap') || // Alice's Roadmap
-    content.includes('invoice') || // Sarah's Invoice
-    sender.includes('hr@') ||      // HR
-    content.includes('open enrollment')
-  ) {
-    return { category: EmailCategory.IMPORTANT, confidence: 0.95 };
-  }
-
-  // Rules for Others (Personal / Rewards / Promo)
-  if (
-    fromName.includes('mom') ||
-    fromName.includes('dad') ||
-    sender.includes('family') ||
-    sender.includes('rewards') ||
-    content.includes('free drink') ||
-    content.includes('points balance') ||
-    (content.includes('dinner') && content.includes('sweetie')) ||
-    fromName.includes('coffee')
-  ) {
-     return { category: EmailCategory.OTHERS, confidence: 0.99 };
-  }
-
-  // General Business Important (Lower confidence fallback)
-  // This helps catch things that might be important but not explicitly defined above
-  if (
-    content.includes("contract") ||
-    content.includes("agreement")
-  ) {
-    return { category: EmailCategory.IMPORTANT, confidence: 0.7 };
-  }
-
+  // Everything else (Important, Others, To-Do, or tricky cases) goes to LLM
   return { confidence: 0 };
 };
 
 /**
- * Phase 2: Vectorized Batch Processing
- * Processes multiple emails in a single API call using structured output.
+ * Phase 2: Vectorized Batch Processing with Chain-of-Thought
+ * Processes multiple emails using strict JSON schema that enforces reasoning.
  */
 export const analyzeBatch = async (
     emails: Email[],
@@ -126,31 +86,37 @@ export const analyzeBatch = async (
       return await withRetry(async () => {
         const client = getClient();
         
-        // Minimize token usage by sending only necessary data
+        // Minimize token usage by sending only necessary data, but INCLUDE senderEmail for context
         const emailData = emails.map(e => ({
           id: e.id,
+          sender: e.sender,
+          senderEmail: e.senderEmail,
           subject: e.subject,
           body: e.body.substring(0, 1000) // Truncate very long emails to fit in batch
         }));
         
         const systemPrompt = `
-        You are a high-performance email triage engine.
+        You are an Advanced Email Logic Engine.
         
-        Reference Definitions:
-        Categorization: ${catPrompt}
-        Action Extraction: ${actionPrompt}
+        Your Goal: Accurately categorize emails and extract tasks based on semantic intent, SENDER DEPARTMENT, and TONE.
         
-        Task:
-        Analyze the provided list of emails. Return a JSON array where each object corresponds to an email ID.
-        For each email, assign a category and extract action items (if any).
+        Definitions:
+        ${catPrompt}
+        ${actionPrompt}
         
-        Strictly follow the JSON schema.
+        Instructions:
+        1. **Analyze Department**: Look at the 'Sender Email'. Is it 'alerts@', 'hr@', 'pm@'? (Usually Important). Is it 'bob@client.com'? (Usually To-Do).
+        2. **Analyze Tone**: Automated/Machine tone = 'Important'. Conversational/Requesting tone = 'To-Do'.
+        3. **Categorize**: Apply the Category based on the Definitions.
+        4. **Extract**: Find specific tasks only if they exist.
+        
+        Output a JSON array matching the schema.
         `;
   
         const response = await client.models.generateContent({
           model: 'gemini-2.5-flash',
           contents: [
-              { role: 'user', parts: [{ text: systemPrompt + "\n\nEmails to Process:\n" + JSON.stringify(emailData) }] }
+              { role: 'user', parts: [{ text: systemPrompt + "\n\nInput Data:\n" + JSON.stringify(emailData) }] }
           ],
           config: {
             responseMimeType: "application/json",
@@ -160,6 +126,7 @@ export const analyzeBatch = async (
                 type: Type.OBJECT,
                 properties: {
                   id: { type: Type.STRING },
+                  reasoning: { type: Type.STRING, description: "Chain-of-thought: 'Sender is X, Tone is Y, therefore Category is Z'." },
                   category: { type: Type.STRING },
                   tasks: {
                     type: Type.ARRAY,
@@ -172,7 +139,7 @@ export const analyzeBatch = async (
                     }
                   }
                 },
-                required: ["id", "category"]
+                required: ["id", "reasoning", "category"]
               }
             }
           }
@@ -181,7 +148,7 @@ export const analyzeBatch = async (
         // Parse result
         const rawResults = JSON.parse(response.text || "[]");
         
-        // Transform array back to map for O(1) lookup
+        // Transform array back to map
         const resultsMap: Record<string, { category: string; actionItems: ActionItem[] }> = {};
         
         rawResults.forEach((res: any) => {
@@ -191,6 +158,9 @@ export const analyzeBatch = async (
             const match = validCategories.find(c => c.toLowerCase() === category.toLowerCase());
             category = match || "Others";
 
+            // We log the reasoning for debugging/transparency, though we don't display it in the simple UI
+            console.log(`[AI Logic] ID: ${res.id} | Cat: ${category} | Reason: ${res.reasoning}`);
+
             resultsMap[res.id] = {
                 category,
                 actionItems: res.tasks || []
@@ -198,7 +168,7 @@ export const analyzeBatch = async (
         });
 
         return resultsMap;
-      }, 3, 2000); // 2s initial delay for retries
+      }, 3, 2000); 
     } catch (error: any) {
       if (error.message === 'QUOTA_EXCEEDED') {
           throw error;
